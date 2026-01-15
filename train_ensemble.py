@@ -105,8 +105,7 @@ for fold, (tr_idx, val_idx) in enumerate(gkf.split(X, y, groups)):
         reg_lambda=0.1,
         random_state=42 + fold
     )
-    xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], 
-                  early_stopping_rounds=100, verbose=False)
+    xgb_model.fit(X_tr, y_tr)
     
     xgb_pred = xgb_model.predict(X_val)
     xgb_final = xgb_pred + train.iloc[val_idx]['country_mean'].values

@@ -24,7 +24,7 @@ else:
 print('='*60)
 
 def extract_features_gpu(tif_path):
-    """GPU-accelerated feature extraction with CORRECT Sentinel-2 bands"""
+    """GPU-accelerated feature extraction with CORRECT Sentinel-2 bands + ADVANCED features"""
     try:
         with rasterio.open(tif_path) as src:
             bands = src.read()
@@ -41,34 +41,91 @@ def extract_features_gpu(tif_path):
                 
                 # ✅ CORRECT formulas
                 ndvi = (nir - red) / (nir + red + eps)
-                ndbi = (swir - nir) / (swir + nir + eps)  # FIXED!
+                ndbi = (swir - nir) / (swir + nir + eps)
+                ndwi = (green - nir) / (green + nir + eps)  # Water index
                 
                 # Filter valid pixels
                 mask = (red > 0) & (nir > 0) & (swir > 0)
                 ndvi_valid = ndvi[mask]
                 ndbi_valid = ndbi[mask]
+                ndwi_valid = ndwi[mask]
                 
-                # 🔥 NEW: Built-up and vegetation ratios
-                builtup_ratio = float(torch.sum(ndbi > 0).cpu()) / float(torch.numel(ndbi))
-                vegetation_ratio = float(torch.sum(ndvi > 0.3).cpu()) / float(torch.numel(ndvi))
-                urban_ratio = float(torch.sum(ndbi > 0.1).cpu()) / float(torch.numel(ndbi))
+                # 🔥 RATIO FEATURES (CRITICAL!)
+                total_pixels = float(torch.numel(ndvi))
+                builtup_ratio = float(torch.sum(ndbi > 0).cpu()) / total_pixels
+                dense_urban_ratio = float(torch.sum(ndbi > 0.1).cpu()) / total_pixels
+                vegetation_ratio = float(torch.sum(ndvi > 0.3).cpu()) / total_pixels
+                dense_veg_ratio = float(torch.sum(ndvi > 0.5).cpu()) / total_pixels
+                water_ratio = float(torch.sum(ndwi > 0.3).cpu()) / total_pixels
+                barren_ratio = float(torch.sum((ndvi < 0.1) & (ndbi < 0.1)).cpu()) / total_pixels
+                
+                # 🔥 TEXTURE FEATURES
+                # Sobel edge detection
+                sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device)
+                sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device)
+                
+                red_pad = torch.nn.functional.pad(red.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='reflect')
+                grad_x = torch.nn.functional.conv2d(red_pad, sobel_x.unsqueeze(0).unsqueeze(0))
+                grad_y = torch.nn.functional.conv2d(red_pad, sobel_y.unsqueeze(0).unsqueeze(0))
+                edge_magnitude = torch.sqrt(grad_x**2 + grad_y**2).squeeze()
+                
+                edge_density = float(torch.mean(edge_magnitude).cpu())
+                edge_std = float(torch.std(edge_magnitude).cpu())
+                
+                # Local variance (texture)
+                red_mean = torch.nn.functional.avg_pool2d(red.unsqueeze(0).unsqueeze(0), 5, stride=1, padding=2)
+                red_var = torch.nn.functional.avg_pool2d((red.unsqueeze(0).unsqueeze(0) - red_mean)**2, 5, stride=1, padding=2)
+                texture_mean = float(torch.mean(red_var).cpu())
+                
+                # 🔥 MULTI-SCALE FEATURES
+                h, w = ndvi.shape
+                # Center crop (urban core)
+                center_h, center_w = h//4, w//4
+                ndvi_center = ndvi[center_h:3*center_h, center_w:3*center_w]
+                ndbi_center = ndbi[center_h:3*center_h, center_w:3*center_w]
+                
+                # Quadrants
+                ndvi_q1 = ndvi[:h//2, :w//2]
+                ndvi_q2 = ndvi[:h//2, w//2:]
+                ndvi_q3 = ndvi[h//2:, :w//2]
+                ndvi_q4 = ndvi[h//2:, w//2:]
+                
+                # Heterogeneity (spatial variation)
+                ndvi_heterogeneity = float(torch.std(torch.tensor([
+                    torch.mean(ndvi_q1).cpu(), torch.mean(ndvi_q2).cpu(),
+                    torch.mean(ndvi_q3).cpu(), torch.mean(ndvi_q4).cpu()
+                ])).cpu())
                 
                 return {
+                    # Basic stats
                     'ndvi_mean': float(torch.mean(ndvi_valid).cpu()) if len(ndvi_valid) > 0 else 0.0,
                     'ndvi_std': float(torch.std(ndvi_valid).cpu()) if len(ndvi_valid) > 0 else 0.0,
                     'ndvi_p10': float(torch.quantile(ndvi_valid, 0.1).cpu()) if len(ndvi_valid) > 0 else 0.0,
                     'ndvi_p90': float(torch.quantile(ndvi_valid, 0.9).cpu()) if len(ndvi_valid) > 0 else 0.0,
                     'ndbi_mean': float(torch.mean(ndbi_valid).cpu()) if len(ndbi_valid) > 0 else 0.0,
                     'ndbi_std': float(torch.std(ndbi_valid).cpu()) if len(ndbi_valid) > 0 else 0.0,
+                    'ndwi_mean': float(torch.mean(ndwi_valid).cpu()) if len(ndwi_valid) > 0 else 0.0,
                     'red_mean': float(torch.mean(red[mask]).cpu()) if torch.sum(mask) > 0 else 0.0,
                     'red_std': float(torch.std(red[mask]).cpu()) if torch.sum(mask) > 0 else 0.0,
                     'nir_mean': float(torch.mean(nir[mask]).cpu()) if torch.sum(mask) > 0 else 0.0,
                     'blue_mean': float(torch.mean(blue[mask]).cpu()) if torch.sum(mask) > 0 else 0.0,
                     'green_mean': float(torch.mean(green[mask]).cpu()) if torch.sum(mask) > 0 else 0.0,
                     'swir_mean': float(torch.mean(swir[mask]).cpu()) if torch.sum(mask) > 0 else 0.0,
+                    # 🔥 RATIO FEATURES
                     'builtup_ratio': builtup_ratio,
+                    'dense_urban_ratio': dense_urban_ratio,
                     'vegetation_ratio': vegetation_ratio,
-                    'urban_ratio': urban_ratio,
+                    'dense_veg_ratio': dense_veg_ratio,
+                    'water_ratio': water_ratio,
+                    'barren_ratio': barren_ratio,
+                    # 🔥 TEXTURE FEATURES
+                    'edge_density': edge_density,
+                    'edge_std': edge_std,
+                    'texture_mean': texture_mean,
+                    # 🔥 MULTI-SCALE FEATURES
+                    'ndvi_center': float(torch.mean(ndvi_center).cpu()) if ndvi_center.numel() > 0 else 0.0,
+                    'ndbi_center': float(torch.mean(ndbi_center).cpu()) if ndbi_center.numel() > 0 else 0.0,
+                    'ndvi_heterogeneity': ndvi_heterogeneity,
                 }
             else:
                 # VIIRS single band
@@ -118,10 +175,13 @@ if __name__ == '__main__':
     import time
     start = time.time()
     
-    print('\n🔥 FIXED: Using CORRECT Sentinel-2 band mapping!')
-    print('Blue=B2, Green=B3, Red=B4, NIR=B8, SWIR=B11')
-    print('NDVI = (NIR-Red)/(NIR+Red)')
-    print('NDBI = (SWIR-NIR)/(SWIR+NIR) ✅')
+    print('\n🔥 ADVANCED FEATURE EXTRACTION')
+    print('='*60)
+    print('✅ Correct Sentinel-2 bands (B2,B3,B4,B8,B11)')
+    print('✅ NDVI, NDBI, NDWI indices')
+    print('🔥 Ratio features: builtup, vegetation, water, barren')
+    print('🔥 Texture features: edge density, local variance')
+    print('🔥 Multi-scale: center crop, quadrants, heterogeneity')
     print('='*60)
     
     train = pd.read_csv(DATA_DIR / 'train_tabular.csv')
