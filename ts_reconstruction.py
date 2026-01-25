@@ -1,165 +1,164 @@
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import KFold
-from sklearn.metrics import mean_absolute_error
 import lightgbm as lgb
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_absolute_error
+import warnings
+warnings.filterwarnings("ignore")
 
-# ================================
+# =========================
 # CONFIG
-# ================================
+# =========================
+TARGET = "construction_cost_per_m2_usd"
 TRAIN_CSV = "datasets/train_tabular.csv"
 TEST_CSV  = "datasets/evaluation_tabular_no_target.csv"
-TARGET = "construction_cost_per_m2_usd"
 N_FOLDS = 5
 SEED = 42
 
-# ================================
+# =========================
 # LOAD
-# ================================
+# =========================
 print("Loading data...")
 train = pd.read_csv(TRAIN_CSV)
 test  = pd.read_csv(TEST_CSV)
 
-train["is_train"] = 1
-test["is_train"] = 0
-test[TARGET] = np.nan
-
-all_data = pd.concat([train, test], ignore_index=True)
-
-# ================================
+# =========================
 # TIME FEATURES
-# ================================
-all_data["year"] = all_data["quarter_label"].str[:4].astype(int)
-all_data["quarter"] = all_data["quarter_label"].str[-1].astype(int)
-all_data["t"] = all_data["year"] * 4 + all_data["quarter"]
+# =========================
+def add_time(df):
+    df = df.copy()
+    df["year"] = df["quarter_label"].str[:4].astype(int)
+    df["q"] = df["quarter_label"].str[-2:].map({"Q1":1,"Q2":2,"Q3":3,"Q4":4})
+    df["time_idx"] = df["year"] * 4 + df["q"]
+    return df
 
-# ================================
-# SORT
-# ================================
-all_data = all_data.sort_values(["geolocation_name", "t"]).reset_index(drop=True)
+train = add_time(train)
+test  = add_time(test)
 
-# ================================
-# 🔥 PURE INTERPOLATION PER LOCATION (NUCLEAR LEAK)
-# ================================
-print("Building interpolation baseline...")
+# =========================
+# COUNTRY FLAG
+# =========================
+train["is_japan"] = (train["country"] == "Japan").astype(int)
+test["is_japan"]  = (test["country"] == "Japan").astype(int)
 
-def interpolate_loc(df):
-    s = df[TARGET]
-    s2 = s.copy()
+# =========================
+# PREF CODE (SAFE)
+# =========================
+train["pref_code"] = train["geolocation_name"].str.extract(r"(\d+)")
+test["pref_code"]  = test["geolocation_name"].str.extract(r"(\d+)")
 
-    # interpolate in time
-    s2 = s2.interpolate(method="linear", limit_direction="both")
+train["pref_code"] = train["pref_code"].fillna(-1).astype(int)
+test["pref_code"]  = test["pref_code"].fillna(-1).astype(int)
 
-    # fallback
-    s2 = s2.ffill().bfill()
+# =========================
+# CV-SAFE LOCATION ENCODING
+# =========================
+print("Building CV-safe location features...")
 
-    return s2
+gkf = GroupKFold(n_splits=5)
+groups = train["geolocation_name"]
 
-all_data["interp_pred"] = all_data.groupby("geolocation_name", group_keys=False).apply(interpolate_loc)
+for c in ["loc_mean","loc_std","loc_min","loc_max"]:
+    train[c] = np.nan
 
-# ================================
-# EXTRA LEAKY FEATURES
-# ================================
-grp = all_data.groupby("geolocation_name")
+for fold, (tr_idx, va_idx) in enumerate(gkf.split(train, train[TARGET], groups)):
+    tr = train.iloc[tr_idx]
+    va = train.iloc[va_idx]
 
-all_data["loc_mean"] = grp[TARGET].transform("mean")
-all_data["loc_last"] = grp[TARGET].shift(1)
-all_data["loc_next"] = grp[TARGET].shift(-1)
+    stats = tr.groupby("geolocation_name")[TARGET].agg(["mean","std","min","max"])
 
-all_data["country_mean"] = all_data.groupby("country")[TARGET].transform("mean")
+    train.loc[va_idx, "loc_mean"] = va["geolocation_name"].map(stats["mean"])
+    train.loc[va_idx, "loc_std"]  = va["geolocation_name"].map(stats["std"])
+    train.loc[va_idx, "loc_min"]  = va["geolocation_name"].map(stats["min"])
+    train.loc[va_idx, "loc_max"]  = va["geolocation_name"].map(stats["max"])
 
-# Fill
-for c in ["loc_mean","loc_last","loc_next","country_mean"]:
-    all_data[c] = all_data[c].fillna(all_data["interp_pred"])
+# Fill missing
+for c in ["loc_mean","loc_std","loc_min","loc_max"]:
+    train[c] = train[c].fillna(train[TARGET].mean())
 
-# ================================
-# SPLIT
-# ================================
-train = all_data[all_data["is_train"] == 1].copy()
-test  = all_data[all_data["is_train"] == 0].copy()
+# =========================
+# FULL STATS FOR TEST
+# =========================
+full_stats = train.groupby("geolocation_name")[TARGET].agg(["mean","std","min","max"])
 
-# ================================
-# 🎯 RESIDUAL LEARNING (TINY CORRECTION)
-# ================================
-train["residual"] = train[TARGET] - train["interp_pred"]
+test["loc_mean"] = test["geolocation_name"].map(full_stats["mean"])
+test["loc_std"]  = test["geolocation_name"].map(full_stats["std"])
+test["loc_min"]  = test["geolocation_name"].map(full_stats["min"])
+test["loc_max"]  = test["geolocation_name"].map(full_stats["max"])
 
-# ================================
+for c in ["loc_mean","loc_std","loc_min","loc_max"]:
+    test[c] = test[c].fillna(train[TARGET].mean())
+
+# =========================
 # FEATURES
-# ================================
-features = [
-    "interp_pred",
-    "loc_mean",
-    "loc_last",
-    "loc_next",
-    "country_mean",
-    "straight_distance_to_capital_km"
-]
+# =========================
+drop_cols = [TARGET, "data_id", "geolocation_name", "quarter_label", "country"]
+features = [c for c in train.columns if c not in drop_cols]
 
-X = train[features].fillna(0)
-y = train["residual"].values
-X_test = test[features].fillna(0)
+X = train[features]
+X_test = test[features]
 
-# ================================
-# CV
-# ================================
-kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+# keep only numeric
+X = X.select_dtypes(include=[np.number])
+X_test = X_test[X.columns]
+
+y = train[TARGET]
+
+# =========================
+# TRAIN
+# =========================
+print("Training single global model...")
 
 oof = np.zeros(len(train))
 test_preds = np.zeros(len(test))
 
-print("Training LightGBM residual corrector...")
-
-for fold, (tr_idx, va_idx) in enumerate(kf.split(X)):
+for fold, (tr_idx, va_idx) in enumerate(gkf.split(X, y, groups)):
     print(f"Fold {fold+1}")
 
-    X_tr, X_va = X.iloc[tr_idx], X.iloc[va_idx]
-    y_tr, y_va = y[tr_idx], y[va_idx]
+    Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
+    ytr, yva = y.iloc[tr_idx], y.iloc[va_idx]
 
     model = lgb.LGBMRegressor(
-        n_estimators=1000,
-        learning_rate=0.05,
-        num_leaves=32,
-        subsample=0.9,
-        colsample_bytree=0.9,
+        n_estimators=3000,
+        learning_rate=0.03,
+        num_leaves=64,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_samples=5,
+        reg_alpha=0.1,
+        reg_lambda=0.1,
         random_state=SEED + fold
     )
 
     model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_va, y_va)],
+        Xtr, ytr,
+        eval_set=[(Xva, yva)],
         eval_metric="mae",
         callbacks=[lgb.early_stopping(100, verbose=False)]
     )
 
-    oof[va_idx] = model.predict(X_va)
+    pred = model.predict(Xva)
+    oof[va_idx] = pred
     test_preds += model.predict(X_test) / N_FOLDS
 
-    mae = mean_absolute_error(y_va, oof[va_idx])
-    print("  Fold MAE:", mae)
+    print("  Fold MAE:", mean_absolute_error(yva, pred))
 
-print("\nResidual CV MAE:", mean_absolute_error(y, oof))
+# =========================
+# FINAL
+# =========================
+mae = mean_absolute_error(y, oof)
+print("\n==============================")
+print("FINAL CV MAE:", mae)
+print("==============================")
 
-# ================================
-# FINAL PRED
-# ================================
-final_test_pred = test["interp_pred"].values + test_preds
+test_preds = np.clip(test_preds, 50, 6000)
 
-# ================================
-# SAFETY CLIP
-# ================================
-final_test_pred = np.clip(final_test_pred, 50, 6000)
-
-# ================================
-# SUBMISSION
-# ================================
 sub = pd.DataFrame({
-    "data_id": test["data_id"].values,
-    TARGET: final_test_pred
+    "data_id": test["data_id"],
+    TARGET: test_preds
 })
 
-sub.to_csv("submission_ultra_leakage.csv", index=False)
-
-print("\nSaved: submission_ultra_leakage.csv")
-print("Range:", final_test_pred.min(), final_test_pred.max())
-print("Mean :", final_test_pred.mean())
-print("DONE")
+sub.to_csv("submission_magic_location_global.csv", index=False)
+print("\nSaved: submission_magic_location_global.csv")
+print("Range:", test_preds.min(), test_preds.max())
+print("Mean :", test_preds.mean())
