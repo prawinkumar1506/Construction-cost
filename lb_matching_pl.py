@@ -141,3 +141,8 @@ sub.to_csv("submission_lb_matching.csv", index=False)
 print("\nSaved: submission_lb_matching.csv")
 print("Range:", test_preds.min(), test_preds.max())
 print("Mean :", test_preds.mean())
+import numpy as np
+np.save("oof_lb_matching.npy", oof)
+np.save("test_lb_matching.npy", test_preds)
+print("Saved oof_lb_matching.npy and test_lb_matching.npy")
+

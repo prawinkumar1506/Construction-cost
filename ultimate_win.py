@@ -184,3 +184,7 @@ print("\nSaved: submission_ultimate_location_time.csv")
 print("Range:", test_preds.min(), test_preds.max())
 print("Mean :", test_preds.mean())
 print("DONE")
+import numpy as np
+np.save("oof_ultimate.npy", oof)
+np.save("test_ultimate.npy", test_preds)
+print("Saved oof_ultimate.npy and test_ultimate.npy")
